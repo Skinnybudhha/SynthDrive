@@ -14,7 +14,6 @@ from keras.optimizers import Adam
 from keras.models import Model
 from keras.callbacks import TensorBoard
 import tensorflow as tf
-from threading import Thread
 from tqdm import tqdm
 
 # Adjust this path according to your Carla installation
@@ -46,7 +45,7 @@ MODEL_NAME = "Xception"
 MEMORY_FRACTION = 0.4
 MIN_REWARD = -200
 
-EPISODES = None
+EPISODES = 500  # Set the number of episodes
 DISCOUNT = 0.99
 epsilon = 1
 EPSILON_DECAY = 0.95
@@ -54,12 +53,16 @@ MIN_EPSILON = 0.001
 
 AGGREGATE_STATS_EVERY = 10
 
+ep_rewards = []  # List to store episode rewards
+
 # Own Tensorboard class
 class ModifiedTensorBoard(TensorBoard):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.step = 1
-        self.writer = tf.summary.FileWriter(self.log_dir)
+        self.writer = tf.summary.create_file_writer(self.log_dir)
+        self._train_dir = self.log_dir  # Add the missing attribute _train_dir
+        self._train_step = 1  # Add the missing attribute _train_step
 
     def set_model(self, model):
         pass
@@ -74,7 +77,11 @@ class ModifiedTensorBoard(TensorBoard):
         pass
 
     def update_stats(self, **stats):
-        self._write_logs(stats, self.step)
+        with self.writer.as_default():
+            for key, value in stats.items():
+                tf.summary.scalar(key, value, step=self.step)
+                self.step += 1
+            self.writer.flush()
 
 class CarEnv:
     SHOW_CAM = SHOW_PREVIEW
@@ -90,26 +97,28 @@ class CarEnv:
         self.blueprint_library = self.world.get_blueprint_library()
         self.model_3 = self.blueprint_library.filter("model3")[0]
 
-    def reset(self):
-        self.collision_hist = []
-        self.actor_list = []
-
-        self.transform = random.choice(self.world.get_map().get_spawn_points())
-        self.vehicle = self.world.spawn_actor(self.model_3, self.transform)
-        self.actor_list.append(self.vehicle)
-
         self.rgb_cam = self.blueprint_library.find('sensor.camera.rgb')
         self.rgb_cam.set_attribute("image_size_x", f"{self.im_width}")
         self.rgb_cam.set_attribute("image_size_y", f"{self.im_height}")
         self.rgb_cam.set_attribute("fov", f"110")
 
-        transform = carla.Transform(carla.Location(x=2.5, z=0.7))
-        self.sensor = self.world.spawn_actor(self.rgb_cam, transform, attach_to=self.vehicle)
-        self.actor_list.append(self.sensor)
-        self.sensor.listen(lambda data: self.process_img(data))
+    def reset(self):
+        self.collision_hist = []
+        self.actor_list = []
 
-        self.vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0))
-        time.sleep(4)
+        while True:
+            try:
+                self.transform = random.choice(self.world.get_map().get_spawn_points())
+                self.vehicle = self.world.spawn_actor(self.model_3, self.transform)
+                self.actor_list.append(self.vehicle)
+
+                transform = carla.Transform(carla.Location(x=2.5, z=0.7))
+                self.sensor = self.world.spawn_actor(self.rgb_cam, transform, attach_to=self.vehicle)
+                self.actor_list.append(self.sensor)
+                self.sensor.listen(lambda data: self.process_img(data))
+                break
+            except RuntimeError:
+                self.reset()
 
         colsensor = self.blueprint_library.find("sensor.other.collision")
         self.colsensor = self.world.spawn_actor(colsensor, transform, attach_to=self.vehicle)
@@ -126,6 +135,11 @@ class CarEnv:
 
     def collision_data(self, event):
         self.collision_hist.append(event)
+        if isinstance(event.other_actor, carla.Vehicle):
+            # Check if the collided vehicle is still alive in the simulation
+            if event.other_actor.is_alive:
+                # Destroy the collided vehicle
+                event.other_actor.destroy()
 
     def process_img(self, image):
         i = np.array(image.raw_data)
@@ -172,11 +186,8 @@ class DQNAgent:
 
         self.tensorboard = ModifiedTensorBoard(log_dir=f"logs/{MODEL_NAME}-{int(time.time())}")
         self.target_update_counter = 0
-        self.graph = tf.get_default_graph()
 
         self.terminate = False
-        self.last_logged_episode = 0
-        self.training_initialized = False
 
     def create_model(self):
         base_model = Xception(weights=None, include_top=False, input_shape=(IM_HEIGHT, IM_WIDTH,3))
@@ -186,7 +197,7 @@ class DQNAgent:
 
         predictions = Dense(3, activation="linear")(x)
         model = Model(inputs=base_model.input, outputs=predictions)
-        model.compile(loss="mse", optimizer=Adam(lr=0.001), metrics=["accuracy"])
+        model.compile(loss="mse", optimizer=Adam(learning_rate=0.001), metrics=["accuracy"])
         return model
 
     def update_replay_memory(self, transition):
@@ -198,13 +209,11 @@ class DQNAgent:
 
         minibatch = random.sample(self.replay_memory, MINIBATCH_SIZE)
 
-        current_states = np.array([transition[0] for transition in minibatch])/255
-        with self.graph.as_default():
-            current_qs_list = self.model.predict(current_states, PREDICTION_BATCH_SIZE)
+        current_states = np.array([transition[0] for transition in minibatch]) / 255
+        current_qs_list = self.model.predict(current_states, batch_size=PREDICTION_BATCH_SIZE)
 
-        new_current_states = np.array([transition[3] for transition in minibatch])/255
-        with self.graph.as_default():
-            future_qs_list = self.target_model.predict(new_current_states, PREDICTION_BATCH_SIZE)
+        new_current_states = np.array([transition[3] for transition in minibatch]) / 255
+        future_qs_list = self.target_model.predict(new_current_states, batch_size=PREDICTION_BATCH_SIZE)
 
         X = []
         y = []
@@ -222,40 +231,33 @@ class DQNAgent:
             X.append(current_state)
             y.append(current_qs)
 
-        log_this_step = False
-        if self.tensorboard.step > self.last_logged_episode:
-            log_this_step = True
-            self.last_log_episode = self.tensorboard.step
+        self.model.fit(np.array(X) / 255, np.array(y), batch_size=TRAINING_BATCH_SIZE, verbose=0,
+                       callbacks=[self.tensorboard])
 
-        with self.graph.as_default():
-            self.model.fit(np.array(X)/255, np.array(y), batch_size=TRAINING_BATCH_SIZE, verbose=0, shuffle=False,
-                           callbacks=[self.tensorboard] if log_this_step else None)
-
-        if log_this_step:
-            self.target_update_counter += 1
+        self.target_update_counter += 1
 
         if self.target_update_counter > UPDATE_TARGET_EVERY:
             self.target_model.set_weights(self.model.get_weights())
             self.target_update_counter = 0
 
     def get_qs(self, state):
-        return self.model.predict(np.array(state).reshape(-1, *state.shape)/255)[0]
+        return self.model.predict(np.array(state).reshape(-1, *state.shape) / 255)[0]
 
-def visualize_thread():
+def visualize_thread(env):
     while True:
         if env.front_camera is not None:
             cv2.imshow("Front Camera", env.front_camera)
             if cv2.waitKey(1) == ord('q'):  # Press 'q' to quit
                 break
 
-env = CarEnv()
-agent = DQNAgent()
-
 if __name__ == "__main__":
-    visualize_thread = threading.Thread(target=visualize_thread)
+    env = CarEnv()
+    agent = DQNAgent()
+
+    visualize_thread = threading.Thread(target=visualize_thread, args=(env,))
     visualize_thread.start()
 
-    for episode in tqdm(range(1, EPISODES+1), ascii=True, unit='episodes'):
+    for episode in tqdm(range(1, EPISODES + 1), ascii=True, unit='episodes'):
         env.reset()
         done = False
 
@@ -269,7 +271,7 @@ if __name__ == "__main__":
                 action = np.argmax(agent.get_qs(current_state))
             else:
                 action = np.random.randint(0, 3)
-                time.sleep(1/30)
+                time.sleep(1 / 30)
 
             new_state, reward, done, _ = env.step(action)
 
@@ -281,29 +283,10 @@ if __name__ == "__main__":
             current_state = new_state
             step += 1
 
-        # Append episode reward to a list and log stats (every given number of episodes)
         ep_rewards.append(episode_reward)
-        if not episode % AGGREGATE_STATS_EVERY or episode == 1:
-            average_reward = sum(ep_rewards[-AGGREGATE_STATS_EVERY:])/len(ep_rewards[-AGGREGATE_STATS_EVERY:])
-            min_reward = min(ep_rewards[-AGGREGATE_STATS_EVERY:])
-            max_reward = max(ep_rewards[-AGGREGATE_STATS_EVERY:])
-            agent.tensorboard.update_stats(reward_avg=average_reward, reward_min=min_reward, reward_max=max_reward,
-                                           epsilon=epsilon)
-
-            # Save model, but only when min reward is greater or equal a set value
-            if min_reward >= MIN_REWARD:
-                agent.model.save(f'models/{MODEL_NAME}__{max_reward:_>7.2f}max_{average_reward:_>7.2f}avg_{min_reward:_>7.2f}min__{int(time.time())}.model')
-
-        # Decay epsilon
-        if epsilon > MIN_EPSILON:
-            epsilon *= EPSILON_DECAY
-            epsilon = max(MIN_EPSILON, epsilon)
-
-        agent.tensorboard.update_stats(reward_avg=episode_reward)
 
         if episode % AGGREGATE_STATS_EVERY == 0:
             print(f"Episode: {episode}, epsilon: {epsilon}")
 
-    # Set termination flag after training is done
     agent.terminate = True
     visualize_thread.join()
