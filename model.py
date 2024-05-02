@@ -1,4 +1,3 @@
-import glob
 import os
 import sys
 import random
@@ -15,6 +14,7 @@ from keras.models import Model
 from keras.callbacks import TensorBoard
 import tensorflow as tf
 from tqdm import tqdm
+import glob
 
 # Adjust this path according to your Carla installation
 CARLA_EGG_PATH = 'D:/carla/WindowsNoEditor/PythonAPI/carla/dist/carla-*%d.%d-%s.egg' % (
@@ -51,7 +51,7 @@ epsilon = 1
 EPSILON_DECAY = 0.95
 MIN_EPSILON = 0.001
 
-AGGREGATE_STATS_EVERY = 10
+AGGREGATE_STATS_EVERY = 100  # Update progress after every 100 episodes
 
 ep_rewards = []  # List to store episode rewards
 
@@ -96,21 +96,23 @@ class CarEnv:
         self.world = self.client.get_world()
         self.blueprint_library = self.world.get_blueprint_library()
         self.model_3 = self.blueprint_library.filter("model3")[0]
-
-        self.rgb_cam = self.blueprint_library.find('sensor.camera.rgb')
-        self.rgb_cam.set_attribute("image_size_x", f"{self.im_width}")
-        self.rgb_cam.set_attribute("image_size_y", f"{self.im_height}")
-        self.rgb_cam.set_attribute("fov", f"110")
+        self.actor_list = []  # Initialize actor_list here
 
     def reset(self):
+        self.destroy()  # Destroy existing actors and sensors
+
         self.collision_hist = []
-        self.actor_list = []
 
         while True:
             try:
                 self.transform = random.choice(self.world.get_map().get_spawn_points())
                 self.vehicle = self.world.spawn_actor(self.model_3, self.transform)
                 self.actor_list.append(self.vehicle)
+
+                self.rgb_cam = self.blueprint_library.find('sensor.camera.rgb')
+                self.rgb_cam.set_attribute("image_size_x", f"{self.im_width}")
+                self.rgb_cam.set_attribute("image_size_y", f"{self.im_height}")
+                self.rgb_cam.set_attribute("fov", f"110")
 
                 transform = carla.Transform(carla.Location(x=2.5, z=0.7))
                 self.sensor = self.world.spawn_actor(self.rgb_cam, transform, attach_to=self.vehicle)
@@ -136,10 +138,10 @@ class CarEnv:
     def collision_data(self, event):
         self.collision_hist.append(event)
         if isinstance(event.other_actor, carla.Vehicle):
-            # Check if the collided vehicle is still alive in the simulation
             if event.other_actor.is_alive:
-                # Destroy the collided vehicle
                 event.other_actor.destroy()
+                if event.other_actor in self.actor_list:
+                    self.actor_list.remove(event.other_actor)
 
     def process_img(self, image):
         i = np.array(image.raw_data)
@@ -176,21 +178,40 @@ class CarEnv:
 
         return self.front_camera, reward, done, None
 
+    def destroy(self):
+        print("Cleaning up actors...")
+        for actor in self.actor_list:
+            if actor is not None:
+                try:
+                    actor.destroy()
+                except Exception as e:
+                    print(f"Error while destroying actor: {e}")
+
+    def __del__(self):
+        self.destroy()
+
+
+
 class DQNAgent:
-    def __init__(self):
+    def __init__(self, gradient_accumulation_steps=4):
         self.model = self.create_model()
         self.target_model = self.create_model()
         self.target_model.set_weights(self.model.get_weights())
+
+        
 
         self.replay_memory = deque(maxlen=REPLAY_MEMORY_SIZE)
 
         self.tensorboard = ModifiedTensorBoard(log_dir=f"logs/{MODEL_NAME}-{int(time.time())}")
         self.target_update_counter = 0
 
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.gradient_accumulation_counter = 0
+
         self.terminate = False
 
     def create_model(self):
-        base_model = Xception(weights=None, include_top=False, input_shape=(IM_HEIGHT, IM_WIDTH,3))
+        base_model = Xception(weights=None, include_top=False, input_shape=(IM_HEIGHT, IM_WIDTH, 3))
 
         x = base_model.output
         x = GlobalAveragePooling2D()(x)
@@ -288,5 +309,9 @@ if __name__ == "__main__":
         if episode % AGGREGATE_STATS_EVERY == 0:
             print(f"Episode: {episode}, epsilon: {epsilon}")
 
+            # Save the model after every 100 episodes
+            agent.model.save(f"models/{MODEL_NAME}_episode_{episode}.h5")
+
     agent.terminate = True
     visualize_thread.join()
+
